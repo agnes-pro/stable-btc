@@ -387,3 +387,40 @@
     )
   )
 )
+
+;; Read-only functions
+(define-read-only (get-position (user principal))
+  (map-get? positions user)
+)
+
+(define-read-only (get-collateralization-ratio (user principal))
+  (let (
+    (position (unwrap! (map-get? positions user) none))
+    (price-data (unwrap! (var-get btc-price-in-usd) none))
+    (price (get price price-data))
+    (collateral (get collateral position))
+    (debt (get debt position))
+  )
+    (if (is-eq debt u0)
+      none
+      (some (/ (* (collateral-value collateral price) u100) debt))
+    )
+  )
+)
+
+(define-read-only (get-protocol-stats)
+  {
+    total-debt: (var-get total-debt),
+    total-collateral: (var-get total-collateral),
+    stability-fee: (var-get stability-fee),
+    protocol-paused: (var-get protocol-paused),
+    btc-price: (var-get btc-price-in-usd)
+  }
+)
+
+;; Initialize protocol
+(define-private (set-contract-owner)
+  (var-set protocol-owner tx-sender)
+)
+
+(set-contract-owner)
