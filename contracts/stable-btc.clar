@@ -13,6 +13,7 @@
 (define-constant ERR-PRICE-EXPIRED (err u1006))
 (define-constant ERR-PROTOCOL-PAUSED (err u1007))
 (define-constant ERR-INVALID-AMOUNT (err u1008))
+(define-constant ERR-NO-PRICE-DATA (err u1009))
 
 ;; Protocol parameters
 (define-constant COLLATERAL-RATIO u150) ;; 150% minimum collateral ratio (1.5x)
@@ -148,53 +149,55 @@
 )
 
 ;; Fixed get-current-price function to ensure consistent return type
-(define-private (get-current-price)
-  (let (
-    (price-data (unwrap! (var-get btc-price-in-usd) (err ERR-PRICE-EXPIRED)))
-    (price (get price price-data))
-    (timestamp (get timestamp price-data))
-    (current-timestamp (var-get current-time))
-  )
-    (begin
+(define-read-only (get-current-price)
+  (match (var-get btc-price-in-usd)
+    price-data (let (
+      (price (get price price-data))
+      (timestamp (get timestamp price-data))
+      (current-timestamp (var-get current-time))
+    )
       (if (>= (- current-timestamp timestamp) PRICE_EXPIRY)
-        (err ERR-PRICE-EXPIRED)
+        ERR-PRICE-EXPIRED
         (if (<= price u0)
-          (err ERR-PRICE-EXPIRED)
+          ERR-PRICE-EXPIRED
           (ok price)
         )
-      )
-    )
-  )
+      ))
+    ERR-NO-PRICE-DATA)
 )
 
 ;; Core user functions
 (define-public (create-position (btc-amount uint) (stable-amount uint))
-  (let (
-    (btc-price-result (get-current-price))
-    (user tx-sender)
-    (existing-position (map-get? positions user))
-  )
-    (begin
-      (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
-      (asserts! (>= btc-amount u0) ERR-INVALID-AMOUNT)
-      (asserts! (>= stable-amount MINIMUM_LOAN_AMOUNT) ERR-MINIMUM-LOAN-REQUIRED)
-      
-      ;; Unwrap price with error propagation
-      (let ((btc-price (try! btc-price-result)))
-        
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (>= btc-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= stable-amount MINIMUM_LOAN_AMOUNT) ERR-MINIMUM-LOAN-REQUIRED)
+    
+    ;; Get BTC price first, with error propagation
+    (let (
+      (btc-price (try! (get-current-price)))
+      (user tx-sender)
+      (existing-position (map-get? positions user))
+    )
+      (begin
         ;; Update global interest
         (accrue-global-interest)
         
         ;; Check if user already has a position and update it with interest
-        (if (is-some existing-position)
-          (accrue-position-interest user)
-          false
+        ;; FIX: Store the position data in a variable to handle both branches consistently
+        (let (
+          (current-position 
+            (if (is-some existing-position)
+              (accrue-position-interest user)
+              {collateral: u0, debt: u0, last-update-block: stacks-block-height}
+            )
+          )
         )
         
         ;; Calculate total position after adding new collateral and debt
         (let (
-          (old-collateral (if (is-some existing-position) (get collateral (unwrap-panic existing-position)) u0))
-          (old-debt (if (is-some existing-position) (get debt (unwrap-panic existing-position)) u0))
+          (old-collateral (get collateral current-position))
+          (old-debt (get debt current-position))
           (new-collateral (+ old-collateral btc-amount))
           (new-debt (+ old-debt stable-amount))
           (min-required-collateral (required-collateral new-debt btc-price))
@@ -217,7 +220,7 @@
             ;; Mint stablecoins to user
             (ft-mint? stable-usd stable-amount user)
           )
-        )
+        ))
       )
     )
   )
@@ -241,8 +244,8 @@
       (let (
         (updated-position (accrue-position-interest user))
         (new-debt (get debt updated-position))
-        (old-collateral (get collateral updated-position))
-        (new-collateral (+ old-collateral btc-amount))
+        (current-collateral (get collateral updated-position))
+        (new-collateral (+ current-collateral btc-amount))
       )
         (begin
           ;; Update position
@@ -314,17 +317,16 @@
 )
 
 (define-public (withdraw-collateral (btc-amount uint))
-  (let (
-    (user tx-sender)
-    (btc-price-result (get-current-price))
-  )
-    (begin
-      (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
-      (asserts! (> btc-amount u0) ERR-INVALID-AMOUNT)
-      
-      ;; Unwrap price with error propagation
-      (let ((btc-price (try! btc-price-result)))
-        
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (> btc-amount u0) ERR-INVALID-AMOUNT)
+    
+    ;; Get BTC price first, with error propagation
+    (let (
+      (btc-price (try! (get-current-price)))
+      (user tx-sender)
+    )
+      (begin
         ;; Update global interest
         (accrue-global-interest)
         
@@ -359,53 +361,55 @@
 )
 
 (define-public (liquidate-position (user principal))
-  (let (
-    (liquidator tx-sender)
-    (btc-price-result (get-current-price))
-    (position (unwrap! (map-get? positions user) ERR-POSITION-NOT-FOUND))
-  )
-    (begin
-      (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
-      (asserts! (not (is-eq user liquidator)) ERR-NOT-AUTHORIZED)
-      
-      ;; Unwrap price with error propagation
-      (let ((btc-price (try! btc-price-result)))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (let (
+      (position (unwrap! (map-get? positions user) ERR-POSITION-NOT-FOUND))
+      (liquidator tx-sender)
+    )
+      (begin
+        (asserts! (not (is-eq user liquidator)) ERR-NOT-AUTHORIZED)
         
-        ;; Update global interest
-        (accrue-global-interest)
-        
-        ;; Update position with accrued interest
-        (let (
-          (updated-position (accrue-position-interest user))
-          (debt (get debt updated-position))
-          (collateral (get collateral updated-position))
-          (collateral-value-usd (collateral-value collateral btc-price))
-          (min-safety-value (/ (* debt LIQUIDATION-THRESHOLD) u100))
-        )
+        ;; Get BTC price first, with error propagation
+        (let ((btc-price (try! (get-current-price))))
           (begin
-            ;; Check if position is undercollateralized
-            (asserts! (< collateral-value-usd min-safety-value) ERR-NOT-AUTHORIZED)
+            ;; Update global interest
+            (accrue-global-interest)
             
-            ;; Liquidator must pay back the full debt
-            (try! (ft-burn? stable-usd debt liquidator))
-            
-            ;; Calculate liquidation bonus (collateral * liquidation penalty)
+            ;; Update position with accrued interest
             (let (
-              (liquidation-bonus (/ (* collateral LIQUIDATION-PENALTY) u100))
-              (liquidator-collateral (- collateral liquidation-bonus))
+              (updated-position (accrue-position-interest user))
+              (debt (get debt updated-position))
+              (collateral (get collateral updated-position))
+              (collateral-value-usd (collateral-value collateral btc-price))
+              (min-safety-value (/ (* debt LIQUIDATION-THRESHOLD) u100))
             )
               (begin
-                ;; Update totals
-                (var-set total-collateral (- (var-get total-collateral) collateral))
-                (var-set total-debt (- (var-get total-debt) debt))
+                ;; Check if position is undercollateralized
+                (asserts! (< collateral-value-usd min-safety-value) ERR-NOT-AUTHORIZED)
                 
-                ;; Delete the liquidated position
-                (map-delete positions user)
+                ;; Liquidator must pay back the full debt
+                (try! (ft-burn? stable-usd debt liquidator))
                 
-                ;; Send protocol fee to protocol owner
-                (var-set stability-fee (+ (var-get stability-fee) liquidation-bonus))
-                
-                (ok true)
+                ;; Calculate liquidation bonus (collateral * liquidation penalty)
+                (let (
+                  (liquidation-bonus (/ (* collateral LIQUIDATION-PENALTY) u100))
+                  (liquidator-collateral (- collateral liquidation-bonus))
+                )
+                  (begin
+                    ;; Update totals
+                    (var-set total-collateral (- (var-get total-collateral) collateral))
+                    (var-set total-debt (- (var-get total-debt) debt))
+                    
+                    ;; Delete the liquidated position
+                    (map-delete positions user)
+                    
+                    ;; Send protocol fee to protocol owner
+                    (var-set stability-fee (+ (var-get stability-fee) liquidation-bonus))
+                    
+                    (ok true)
+                  )
+                )
               )
             )
           )
@@ -423,14 +427,26 @@
 (define-read-only (get-collateralization-ratio (user principal))
   (let (
     (position (unwrap! (map-get? positions user) none))
-    (price-data (unwrap! (var-get btc-price-in-usd) none))
-    (price (get price price-data))
-    (collateral (get collateral position))
-    (debt (get debt position))
   )
-    (if (is-eq debt u0)
+    (if (is-some position)
+      (let (
+        (price-data (unwrap! (var-get btc-price-in-usd) none))
+      )
+        (if (is-some price-data)
+          (let (
+            (price (get price (unwrap-panic price-data)))
+            (collateral (get collateral (unwrap-panic position)))
+            (debt (get debt (unwrap-panic position)))
+          )
+            (if (is-eq debt u0)
+              none
+              (some (/ (* (collateral-value collateral price) u100) debt))
+            )
+          )
+          none
+        )
+      )
       none
-      (some (/ (* (collateral-value collateral price) u100) debt))
     )
   )
 )
