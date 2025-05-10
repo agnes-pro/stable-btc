@@ -89,3 +89,117 @@
 (define-private (calculate-interest (debt uint) (blocks-passed uint))
   (/ (* debt (* blocks-passed INTEREST_RATE_PER_BLOCK)) INTEREST_RATE_DENOMINATOR)
 )
+
+(define-private (accrue-global-interest)
+  (let (
+    (current-block stacks-block-height)
+    (last-block (var-get last-accrual-block))
+    (blocks-passed (- current-block last-block))
+    (total-system-debt (var-get total-debt))
+    (interest-accrued (calculate-interest total-system-debt blocks-passed))
+  )
+    (begin
+      (if (> blocks-passed u0)
+        (begin
+          (var-set stability-fee (+ (var-get stability-fee) interest-accrued))
+          (var-set total-debt (+ total-system-debt interest-accrued))
+          (var-set last-accrual-block current-block)
+        )
+        false
+      )
+      true
+    )
+  )
+)
+
+(define-private (accrue-position-interest (user principal))
+  (let (
+    (position (unwrap! (map-get? positions user) false))
+    (debt (get debt position))
+    (collateral (get collateral position))
+    (last-update (get last-update-block position))
+    (blocks-passed (- stacks-block-height last-update))
+    (interest-accrued (calculate-interest debt blocks-passed))
+    (new-debt (+ debt interest-accrued))
+  )
+    (begin
+      (if (> blocks-passed u0)
+        (begin
+          (map-set positions user {
+            collateral: collateral,
+            debt: new-debt,
+            last-update-block: stacks-block-height
+          })
+        )
+        false
+      )
+      {debt: new-debt, collateral: collateral}
+    )
+  )
+)
+
+(define-private (get-current-price)
+  (let (
+    (price-data (unwrap! (var-get btc-price-in-usd) ERR-PRICE-EXPIRED))
+    (price (get price price-data))
+    (timestamp (get timestamp price-data))
+  )
+    (begin
+      (asserts! (< (- block-timestamp timestamp) PRICE_EXPIRY) ERR-PRICE-EXPIRED)
+      (asserts! (> price u0) ERR-PRICE-EXPIRED)
+      price
+    )
+  )
+)
+
+;; Core user functions
+(define-public (create-position (btc-amount uint) (stable-amount uint))
+  (let (
+    (btc-price (get-current-price))
+    (user tx-sender)
+    (existing-position (map-get? positions user))
+  )
+    (begin
+      (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+      (asserts! (>= btc-amount u0) ERR-INVALID-AMOUNT)
+      (asserts! (>= stable-amount MINIMUM_LOAN_AMOUNT) ERR-MINIMUM-LOAN-REQUIRED)
+      
+      ;; Update global interest
+      (accrue-global-interest)
+      
+      ;; Check if user already has a position and update it with interest
+      (if (is-some existing-position)
+        (accrue-position-interest user)
+        false
+      )
+      
+      ;; Calculate total position after adding new collateral and debt
+      (let (
+        (old-collateral (if (is-some existing-position) (get collateral (unwrap-panic existing-position)) u0))
+        (old-debt (if (is-some existing-position) (get debt (unwrap-panic existing-position)) u0))
+        (new-collateral (+ old-collateral btc-amount))
+        (new-debt (+ old-debt stable-amount))
+        (min-required-collateral (required-collateral new-debt btc-price))
+      )
+        (begin
+          ;; Check collateralization
+          (asserts! (>= (collateral-value new-collateral btc-price) min-required-collateral) ERR-INSUFFICIENT-COLLATERAL)
+          
+          ;; Update position
+          (map-set positions user {
+            collateral: new-collateral,
+            debt: new-debt,
+            last-update-block: stacks-block-height
+          })
+          
+          ;; Update totals
+          (var-set total-collateral (+ (var-get total-collateral) btc-amount))
+          (var-set total-debt (+ (var-get total-debt) stable-amount))
+          
+          ;; Mint stablecoins to user
+          (ft-mint? stable-usd stable-amount user)
+        )
+      )
+    )
+  )
+)
