@@ -424,31 +424,21 @@
   (map-get? positions user)
 )
 
+;; FIXED: Fixed the get-collateralization-ratio function to handle optionals correctly
 (define-read-only (get-collateralization-ratio (user principal))
-  (let (
-    (position (unwrap! (map-get? positions user) none))
-  )
-    (if (is-some position)
-      (let (
-        (price-data (unwrap! (var-get btc-price-in-usd) none))
+  (match (map-get? positions user)
+    position (match (var-get btc-price-in-usd)
+      price-data (let (
+        (price (get price price-data))
+        (collateral (get collateral position))
+        (debt (get debt position))
       )
-        (if (is-some price-data)
-          (let (
-            (price (get price (unwrap-panic price-data)))
-            (collateral (get collateral (unwrap-panic position)))
-            (debt (get debt (unwrap-panic position)))
-          )
-            (if (is-eq debt u0)
-              none
-              (some (/ (* (collateral-value collateral price) u100) debt))
-            )
-          )
+        (if (is-eq debt u0)
           none
-        )
-      )
-      none
-    )
-  )
+          (some (/ (* (collateral-value collateral price) u100) debt))
+        ))
+      none)
+    none)
 )
 
 (define-read-only (get-protocol-stats)
